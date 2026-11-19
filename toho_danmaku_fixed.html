@@ -1,0 +1,720 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>東方弾幕ゲーム（修正版）</title>
+  <style>
+    body {
+      margin: 0;
+      padding: 16px 8px;
+      background: #111;
+      color: white;
+      text-align: center;
+      font-family: sans-serif;
+    }
+    canvas {
+      display: block;
+      width: min(480px, 96vw);
+      height: auto;
+      margin: 0 auto;
+      background: black;
+      border: 2px solid white;
+      touch-action: none;
+    }
+    p { margin: 10px auto; font-size: 14px; }
+  </style>
+</head>
+<body>
+<h2>東方弾幕ゲーム（修正版）</h2>
+<canvas id="gameCanvas" width="480" height="640"></canvas>
+<p>移動：矢印キー ／ 低速：Z ／ ショット：X ／ ホーミング切替：V ／ ボム：C ／ ポーズ：Esc</p>
+
+<script>
+"use strict";
+
+const canvas = document.getElementById("gameCanvas");
+const ctx = canvas.getContext("2d");
+
+let frameCount = 0;
+let stage = 1;
+let paused = false;
+let gameEnded = false;
+let score = 0;
+
+const keys = Object.create(null);
+const justPressed = Object.create(null);
+const bullets = [];
+let pbullets = [];
+let homingOn = false;
+
+document.addEventListener("keydown", (e) => {
+  const key = e.key.toLowerCase();
+
+  if (["arrowup", "arrowdown", "arrowleft", "arrowright", " "].includes(key)) {
+    e.preventDefault();
+  }
+
+  if (!keys[key] && !e.repeat) {
+    justPressed[key] = true;
+  }
+  keys[key] = true;
+});
+
+document.addEventListener("keyup", (e) => {
+  keys[e.key.toLowerCase()] = false;
+});
+
+window.addEventListener("blur", () => {
+  for (const key in keys) keys[key] = false;
+  for (const key in justPressed) justPressed[key] = false;
+});
+
+const player = {
+  x: canvas.width / 2,
+  y: canvas.height - 60,
+  size: 5,
+  speed: 3,
+  slowSpeed: 1.5,
+  lives: 3,
+  inv: 0,
+  bombs: 3,
+  bombCD: 0,
+  shootCD: 0
+};
+
+let enemies = [];
+
+function spawnEnemies() {
+  enemies = [];
+  for (let i = 0; i < 4; i++) {
+    enemies.push({
+      x: 80 + 100 * i,
+      y: 120,
+      size: 15,
+      hp: 30,
+      alive: true,
+      shootCD: 0
+    });
+  }
+}
+spawnEnemies();
+
+const boss = {
+  x: canvas.width / 2,
+  y: 80,
+  size: 30,
+  hp: 400,
+  maxHp: 400,
+  phase: 1,
+  phaseChanged: false,
+  alive: false,
+  shootCD: 0,
+  dir: 1,
+  speed: 1.5,
+  spellActive: false,
+  spellName: "",
+  spellTriggered: false,
+  spellFrame: 0
+};
+
+const attackInterval = 60;
+let attackTimer = 0;
+
+function updatePlayer() {
+  if (player.inv > 0) player.inv--;
+
+  const mv = keys["z"] ? player.slowSpeed : player.speed;
+  let dx = 0;
+  let dy = 0;
+
+  if (keys["arrowleft"]) dx--;
+  if (keys["arrowright"]) dx++;
+  if (keys["arrowup"]) dy--;
+  if (keys["arrowdown"]) dy++;
+
+  // 斜め移動が速くならないように正規化
+  if (dx !== 0 || dy !== 0) {
+    const length = Math.hypot(dx, dy);
+    player.x += (dx / length) * mv;
+    player.y += (dy / length) * mv;
+  }
+
+  player.x = Math.max(player.size, Math.min(canvas.width - player.size, player.x));
+  player.y = Math.max(player.size, Math.min(canvas.height - player.size, player.y));
+}
+
+function drawPlayer() {
+  ctx.fillStyle = player.inv > 0
+    ? "rgba(255,255,255,0.5)"
+    : (keys["z"] ? "skyblue" : "white");
+
+  ctx.beginPath();
+  ctx.arc(player.x, player.y, player.size, 0, Math.PI * 2);
+  ctx.fill();
+
+  // 低速時に当たり判定位置を見やすく表示
+  if (keys["z"]) {
+    ctx.fillStyle = "red";
+    ctx.beginPath();
+    ctx.arc(player.x, player.y, 2, 0, Math.PI * 2);
+    ctx.fill();
+  }
+}
+
+function shootPlayer() {
+  if (player.shootCD === 0 && keys["x"]) {
+    if (homingOn) {
+      pbullets.push({
+        x: player.x, y: player.y,
+        vx: 0, vy: -5,
+        size: 5, dmg: 2,
+        homing: true, target: null
+      });
+      player.shootCD = 10;
+    } else {
+      pbullets.push({
+        x: player.x, y: player.y,
+        vx: 0, vy: -7,
+        size: 4, dmg: 4,
+        homing: false, target: null
+      });
+      player.shootCD = 5;
+    }
+  }
+}
+
+function updatePlayerBullets() {
+  for (const b of pbullets) {
+    if (b.homing) {
+      if (!b.target || !b.target.alive) {
+        b.target = null;
+        let minDist = Infinity;
+
+        const candidates = enemies.filter(e => e.alive);
+        if (candidates.length === 0 && boss.alive) {
+          candidates.push(boss);
+        }
+
+        for (const target of candidates) {
+          const dx = target.x - b.x;
+          const dy = target.y - b.y;
+          const dist = dx * dx + dy * dy;
+
+          if (dist < minDist) {
+            minDist = dist;
+            b.target = target;
+          }
+        }
+      }
+
+      if (b.target && b.target.alive) {
+        const dx = b.target.x - b.x;
+        const dy = b.target.y - b.y;
+        const dist = Math.hypot(dx, dy);
+
+        if (dist > 0.1) {
+          const desiredVx = (dx / dist) * 5;
+          const desiredVy = (dy / dist) * 5;
+          b.vx += (desiredVx - b.vx) * 0.2;
+          b.vy += (desiredVy - b.vy) * 0.2;
+        }
+      }
+    }
+
+    b.x += b.vx;
+    b.y += b.vy;
+  }
+
+  pbullets = pbullets.filter(b =>
+    b.y > -10 &&
+    b.y < canvas.height + 10 &&
+    b.x > -10 &&
+    b.x < canvas.width + 10
+  );
+
+  if (player.shootCD > 0) player.shootCD--;
+}
+
+function drawPlayerBullets() {
+  for (const b of pbullets) {
+    ctx.fillStyle = b.homing ? "cyan" : "lime";
+    ctx.beginPath();
+    ctx.arc(b.x, b.y, b.size, 0, Math.PI * 2);
+    ctx.fill();
+  }
+}
+
+function updateEnemies() {
+  for (const e of enemies) {
+    if (!e.alive) continue;
+
+    e.x += Math.sin(frameCount * 0.05) * 1.5;
+
+    if (e.shootCD > 0) {
+      e.shootCD--;
+    } else {
+      enemyShoot(e);
+      e.shootCD = 120;
+    }
+  }
+}
+
+function drawEnemies() {
+  for (const e of enemies) {
+    if (!e.alive) continue;
+
+    ctx.fillStyle = "red";
+    ctx.beginPath();
+    ctx.arc(e.x, e.y, e.size, 0, Math.PI * 2);
+    ctx.fill();
+  }
+}
+
+function enemyShoot(e) {
+  const count = 5;
+  const spread = Math.PI / 6;
+  const baseAngle =
+    Math.atan2(player.y - e.y, player.x - e.x) - spread / 2;
+
+  for (let i = 0; i < count; i++) {
+    const angle = baseAngle + spread * i / (count - 1);
+    bullets.push({
+      x: e.x, y: e.y,
+      vx: Math.cos(angle) * 3,
+      vy: Math.sin(angle) * 3,
+      size: 5,
+      life: 300,
+      color: "orange"
+    });
+  }
+}
+
+// 弾1発につき、命中する敵は1体だけ
+function checkEnemyHit() {
+  for (let i = pbullets.length - 1; i >= 0; i--) {
+    const b = pbullets[i];
+    let hit = false;
+
+    for (const e of enemies) {
+      if (!e.alive) continue;
+
+      const dx = b.x - e.x;
+      const dy = b.y - e.y;
+
+      if (dx * dx + dy * dy < (b.size + e.size) ** 2) {
+        e.hp -= b.dmg;
+        score += 20;
+        hit = true;
+
+        if (e.hp <= 0) {
+          e.alive = false;
+          score += 100;
+        }
+        break;
+      }
+    }
+
+    if (!hit && boss.alive) {
+      const dx = b.x - boss.x;
+      const dy = b.y - boss.y;
+
+      if (dx * dx + dy * dy < (b.size + boss.size) ** 2) {
+        boss.hp -= b.dmg;
+        score += 50;
+        hit = true;
+
+        if (boss.hp <= 0) {
+          defeatBoss();
+        }
+      }
+    }
+
+    if (hit) pbullets.splice(i, 1);
+  }
+}
+
+function defeatBoss() {
+  if (gameEnded) return;
+
+  boss.hp = 0;
+  boss.alive = false;
+  gameEnded = true;
+  score += 1000;
+
+  setTimeout(() => {
+    alert("ボス撃破！\nScore: " + score);
+    location.reload();
+  }, 0);
+}
+
+function spawnBoss() {
+  const bx = boss.x;
+  const by = boss.y;
+
+  if (attackTimer < attackInterval) {
+    attackTimer++;
+    return;
+  }
+  attackTimer = 0;
+
+  if (boss.phase === 1) {
+    // 第一形態：回転する弾幕
+    for (let i = 0; i < 36; i++) {
+      const angle = frameCount * 0.1 + Math.PI * 2 * i / 36;
+      bullets.push({
+        x: bx, y: by,
+        vx: Math.cos(angle) * 2,
+        vy: Math.sin(angle) * 2,
+        size: 5, life: 300, color: "cyan"
+      });
+    }
+
+    for (let i = 0; i < 12; i++) {
+      const angle = Math.PI * 2 * i / 12;
+      bullets.push({
+        x: bx, y: by,
+        vx: Math.cos(angle) * 1.2,
+        vy: Math.sin(angle) * 1.2,
+        size: 12, life: 1000, color: "magenta"
+      });
+    }
+  } else if (boss.phase === 2) {
+    // 第二形態：狙い撃ち＋ランダム弾＋低速大型弾
+    const count = 9;
+    const spread = Math.PI / 4;
+    const baseAngle =
+      Math.atan2(player.y - by, player.x - bx) - spread / 2;
+
+    for (let i = 0; i < count; i++) {
+      const angle = baseAngle + spread * i / (count - 1);
+      bullets.push({
+        x: bx, y: by,
+        vx: Math.cos(angle) * 3,
+        vy: Math.sin(angle) * 3,
+        size: 5, life: 700, color: "orange"
+      });
+    }
+
+    for (let i = 0; i < 20; i++) {
+      const angle = Math.random() * Math.PI * 2;
+      const speed = 1 + Math.random() * 2;
+      bullets.push({
+        x: bx, y: by,
+        vx: Math.cos(angle) * speed,
+        vy: Math.sin(angle) * speed,
+        size: 4, life: 600, color: "yellow"
+      });
+    }
+
+    for (let i = 0; i < 8; i++) {
+      const angle = Math.PI * 2 * i / 8;
+      bullets.push({
+        x: bx, y: by,
+        vx: Math.cos(angle) * 0.8,
+        vy: Math.sin(angle) * 0.8,
+        size: 18, life: 1200, color: "lightgreen"
+      });
+    }
+  }
+}
+
+function startSpell(name) {
+  boss.spellActive = true;
+  boss.spellName = name;
+  boss.spellTriggered = true;
+  boss.spellFrame = 0;
+  attackTimer = 0;
+}
+
+function changeToPhase2() {
+  boss.phase = 2;
+  boss.phaseChanged = true;
+  boss.hp = 600;
+  boss.maxHp = 600;
+  boss.spellActive = false;
+  boss.spellName = "";
+  boss.spellTriggered = false;
+  boss.spellFrame = 0;
+  attackTimer = 0;
+  bullets.length = 0;
+}
+
+function updateBoss() {
+  if (!boss.alive || gameEnded) return;
+
+  boss.x += boss.speed * boss.dir;
+  if (boss.x < boss.size || boss.x > canvas.width - boss.size) {
+    boss.dir *= -1;
+    boss.x = Math.max(boss.size, Math.min(canvas.width - boss.size, boss.x));
+  }
+
+  // 第一形態スペル：HP半分で発動
+  if (boss.phase === 1 && boss.hp <= boss.maxHp / 2 &&
+      !boss.spellTriggered) {
+    startSpell("火符「炎の連弾」");
+  }
+
+  // 第一形態スペルが終わってから第二形態へ移行
+  if (boss.phase === 1 && boss.hp <= boss.maxHp / 4 &&
+      !boss.spellActive && !boss.phaseChanged) {
+    changeToPhase2();
+  }
+
+  if (boss.spellActive && boss.phase === 1) {
+    boss.spellFrame++;
+
+    if (boss.spellFrame % 10 === 0) {
+      const count = 20;
+      const baseAngle = boss.spellFrame * 0.1;
+
+      for (let i = 0; i < count; i++) {
+        const angle = baseAngle + Math.PI * 2 * i / count;
+        bullets.push({
+          x: boss.x, y: boss.y,
+          vx: Math.cos(angle) * 3.5,
+          vy: Math.sin(angle) * 3.5,
+          size: 6, life: 400, color: "red"
+        });
+      }
+    }
+
+    if (boss.spellFrame >= 300) {
+      boss.spellActive = false;
+      boss.spellName = "";
+    }
+  } else if (boss.phase === 2 && !boss.spellTriggered &&
+             boss.hp <= boss.maxHp / 2) {
+    startSpell("幻符「錯乱する夢回廊」");
+  } else if (boss.spellActive && boss.phase === 2) {
+    boss.spellFrame++;
+
+    if (boss.spellFrame % 15 === 0) {
+      const count = 36;
+      const baseAngle = boss.spellFrame * 0.1;
+
+      for (let i = 0; i < count; i++) {
+        const angle = baseAngle + Math.PI * 2 * i / count;
+        bullets.push({
+          x: boss.x, y: boss.y,
+          vx: Math.cos(angle) * 3.5,
+          vy: Math.sin(angle) * 3.5,
+          size: 6,
+          life: 500,
+          color: i % 2 === 0 ? "lightblue" : "yellow"
+        });
+      }
+    }
+
+    if (boss.spellFrame >= 500) {
+      boss.spellActive = false;
+      boss.spellName = "";
+    }
+  } else if (!boss.spellActive) {
+    spawnBoss();
+  }
+}
+
+function updateBullets() {
+  for (const b of bullets) {
+    b.x += b.vx;
+    b.y += b.vy;
+    b.life--;
+  }
+
+  for (let i = bullets.length - 1; i >= 0; i--) {
+    const b = bullets[i];
+    if (
+      b.life <= 0 ||
+      b.x < -30 || b.x > canvas.width + 30 ||
+      b.y < -30 || b.y > canvas.height + 30
+    ) {
+      bullets.splice(i, 1);
+    }
+  }
+}
+
+function drawBullets() {
+  for (const b of bullets) {
+    ctx.fillStyle = b.color;
+    ctx.beginPath();
+    ctx.arc(b.x, b.y, b.size, 0, Math.PI * 2);
+    ctx.fill();
+  }
+}
+
+function checkPlayerHit() {
+  if (player.inv > 0 || gameEnded) return;
+
+  for (let i = bullets.length - 1; i >= 0; i--) {
+    const b = bullets[i];
+    const dx = b.x - player.x;
+    const dy = b.y - player.y;
+
+    if (dx * dx + dy * dy < (b.size + player.size) ** 2) {
+      player.lives--;
+      player.inv = 120;
+
+      // 被弾した弾を消して、同じ弾で連続被弾しないようにする
+      bullets.splice(i, 1);
+
+      if (player.lives <= 0) {
+        gameEnded = true;
+        setTimeout(() => {
+          alert("Game Over\nScore: " + score);
+          location.reload();
+        }, 0);
+      }
+      break;
+    }
+  }
+}
+
+function useBomb() {
+  if (player.bombCD > 0) player.bombCD--;
+
+  // Cキーを押した瞬間だけ発動
+  if (justPressed["c"] && player.bombs > 0 &&
+      player.bombCD === 0 && !gameEnded) {
+    bullets.length = 0;
+    player.bombs--;
+    player.bombCD = 60;
+    score += 500;
+    player.inv = Math.max(player.inv, 60);
+  }
+}
+
+function updateStage() {
+  if (stage === 1 && enemies.every(e => !e.alive)) {
+    stage = 2;
+    boss.alive = true;
+    boss.phase = 1;
+    boss.phaseChanged = false;
+    boss.hp = 400;
+    boss.maxHp = 400;
+    boss.spellActive = false;
+    boss.spellName = "";
+    boss.spellTriggered = false;
+    boss.spellFrame = 0;
+    boss.x = canvas.width / 2;
+    boss.y = 80;
+    boss.dir = 1;
+    attackTimer = 0;
+    bullets.length = 0;
+  }
+}
+
+function drawUI() {
+  ctx.fillStyle = "white";
+  ctx.font = "16px sans-serif";
+  ctx.fillText(
+    `Lives: ${player.lives}  Bombs: ${player.bombs}  Score: ${score}`,
+    10, canvas.height - 20
+  );
+  ctx.fillText(`Stage: ${stage}`, 380, canvas.height - 20);
+  ctx.fillText(`Homing (V): ${homingOn ? "ON" : "OFF"}`, 20, 30);
+
+  if (boss.alive) {
+    const barW = 300;
+    const barH = 16;
+    const bx = (canvas.width - barW) / 2;
+    const by = 10;
+
+    ctx.fillStyle = "gray";
+    ctx.fillRect(bx, by, barW, barH);
+
+    ctx.fillStyle = "red";
+    ctx.fillRect(
+      bx, by,
+      barW * Math.max(0, boss.hp) / boss.maxHp,
+      barH
+    );
+
+    ctx.strokeStyle = "white";
+    ctx.strokeRect(bx, by, barW, barH);
+
+    ctx.fillStyle = "white";
+    ctx.font = "14px sans-serif";
+    ctx.fillText(`Phase: ${boss.phase}`, bx, by + 34);
+
+    if (boss.spellActive) {
+      ctx.font = "20px sans-serif";
+      ctx.fillText(
+        boss.spellName,
+        canvas.width / 2 - ctx.measureText(boss.spellName).width / 2,
+        by + 62
+      );
+    }
+  }
+}
+
+function drawPause() {
+  ctx.fillStyle = "rgba(0, 0, 0, 0.65)";
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+  ctx.fillStyle = "white";
+  ctx.font = "48px sans-serif";
+  ctx.textAlign = "center";
+  ctx.fillText("PAUSED", canvas.width / 2, canvas.height / 2);
+  ctx.font = "16px sans-serif";
+  ctx.fillText("Press Esc to resume", canvas.width / 2, canvas.height / 2 + 35);
+  ctx.textAlign = "left";
+}
+
+function gameLoop() {
+  requestAnimationFrame(gameLoop);
+
+  if (justPressed["escape"]) {
+    paused = !paused;
+  }
+
+  if (justPressed["v"]) {
+    homingOn = !homingOn;
+  }
+
+  if (paused || gameEnded) {
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    if (paused) drawPause();
+    return;
+  }
+
+  frameCount++;
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+  updatePlayer();
+  shootPlayer();
+  updatePlayerBullets();
+
+  updateEnemies();
+  updateBoss();
+
+  updateBullets();
+
+  checkEnemyHit();
+  checkPlayerHit();
+  useBomb();
+  updateStage();
+
+  drawPlayer();
+  drawPlayerBullets();
+  drawEnemies();
+
+  if (boss.alive) {
+    ctx.fillStyle = boss.spellActive ? "deepskyblue" : "purple";
+    ctx.beginPath();
+    ctx.arc(boss.x, boss.y, boss.size, 0, Math.PI * 2);
+    ctx.fill();
+  }
+
+  drawBullets();
+  drawUI();
+
+  // 押した瞬間の入力は1フレームだけ有効
+  for (const key in justPressed) {
+    justPressed[key] = false;
+  }
+}
+
+gameLoop();
+</script>
+</body>
+</html>
